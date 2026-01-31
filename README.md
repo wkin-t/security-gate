@@ -80,37 +80,33 @@ server {
 
 更新安全组规则，放行请求者 IP。
 
-#### 认证方式 (任选其一)
+#### 认证方式
 
-**方式 1: Header 认证 (推荐)**
+**Header 认证 (必需)**
 ```bash
 curl -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
      "https://your-domain.com/open-door?device=my-laptop"
 ```
 
-**方式 2: URL 参数 (不推荐，仅用于兼容)**
-```bash
-curl "https://your-domain.com/open-door?key=YOUR_ACCESS_TOKEN&device=my-laptop"
-```
+> ⚠️ **注意**: 不再支持 URL 参数认证方式 (`?key=TOKEN`)。所有客户端必须改用 Authorization header。
 
 #### 参数
 
 | 参数 | 必填 | 说明 | 示例 |
 |------|------|------|------|
-| `Authorization` | 是* | Header 认证 | `Bearer <token>` |
-| `key` | 是* | URL 参数认证 | `your_token` |
+| `Authorization` (Header) | ✅ | Bearer token 认证 | `Bearer <token>` |
 | `device` | 否 | 设备标识 | `my-laptop` |
-| `timestamp` | 否** | Unix 时间戳 | `1738224000` |
-| `signature` | 否** | HMAC 签名 | `abc123...` |
+| `timestamp` | 否* | Unix 时间戳 | `1738224000` |
+| `signature` | 否* | HMAC-SHA256 签名 | `abc123...` |
 
-\* 两种认证方式至少提供一种
-\** 仅在 `ENABLE_SIGNATURE=true` 时必需
+\* 仅在 `ENABLE_SIGNATURE=true` 时必需
 
 #### 响应
 
 | 状态码 | 说明 |
 |--------|------|
 | 200 | 成功更新或 IP 未变化 |
+| 400 | 请求参数错误 (如使用已弃用的 URL 参数认证) |
 | 403 | 认证失败 (密钥错误/签名无效) |
 | 429 | 速率限制 (每 IP 每分钟最多 5 次) |
 | 500 | 腾讯云 API 调用失败 |
@@ -120,6 +116,15 @@ curl "https://your-domain.com/open-door?key=YOUR_ACCESS_TOKEN&device=my-laptop"
 {
   "status": "success",
   "message": "✅ 更新: [my-laptop] -> 123.45.***.**  (TCP+UDP)"
+}
+```
+
+**使用已弃用的 URL 参数时**:
+```json
+{
+  "error": "URL parameter authentication is no longer supported",
+  "message": "Please use Authorization header instead",
+  "example": "curl -H 'Authorization: Bearer YOUR_TOKEN' https://domain.com/open-door"
 }
 ```
 
@@ -145,7 +150,16 @@ curl "https://your-domain.com/open-door?key=YOUR_ACCESS_TOKEN&device=my-laptop"
 - ✅ **Header 认证**: 避免 URL 泄露密钥
 - ✅ **环境隔离**: 密钥通过环境变量管理
 
-### 高级安全 (可选)
+### 高级安全 (可选，推荐用于公网服务器)
+
+#### 为什么需要签名验证？
+
+| 场景 | 仅 Header 认证 | Header + 签名验证 |
+|------|-------|---------|
+| TOKEN 泄露影响 | 永久有效 | 仅 5 分钟有效 |
+| 防重放攻击 | ❌ | ✅ |
+| 防中间人攻击 | ❌ | ✅ |
+| 公网服务器推荐 | ❌ | ✅ |
 
 #### 启用请求签名验证
 
@@ -154,36 +168,107 @@ curl "https://your-domain.com/open-door?key=YOUR_ACCESS_TOKEN&device=my-laptop"
 ENABLE_SIGNATURE=true
 ```
 
-**2. 客户端生成签名**:
+#### 客户端实现
+
+**macOS / Linux Bash**:
+
+```bash
+#!/bin/bash
+TOKEN="your_access_token"
+DEVICE="my-device"
+API_URL="https://your-domain.com/open-door"
+
+TIMESTAMP=$(date +%s)
+MESSAGE="${DEVICE}:${TIMESTAMP}"
+SIGNATURE=$(echo -n "$MESSAGE" | openssl dgst -sha256 -hmac "$TOKEN" | awk '{print $2}')
+
+echo "Timestamp: $TIMESTAMP"
+echo "Signature: $SIGNATURE"
+
+curl -H "Authorization: Bearer $TOKEN" \
+     "${API_URL}?device=${DEVICE}&timestamp=${TIMESTAMP}&signature=${SIGNATURE}"
+```
+
+**Windows PowerShell**:
+
+```powershell
+$token = "your_access_token"
+$device = "my-device"
+$apiUrl = "https://your-domain.com/open-door"
+
+$timestamp = [int][double]::Parse((Get-Date -UFormat %s))
+$message = "${device}:${timestamp}"
+
+# 计算 HMAC-SHA256 签名
+$hmac = New-Object System.Security.Cryptography.HMACSHA256
+$hmac.Key = [Text.Encoding]::UTF8.GetBytes($token)
+$signatureBytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($message))
+$signature = [BitConverter]::ToString($signatureBytes).Replace("-", "").ToLower()
+
+Write-Host "Timestamp: $timestamp"
+Write-Host "Signature: $signature"
+
+$headers = @{ "Authorization" = "Bearer $token" }
+$params = @{
+    "device" = $device
+    "timestamp" = $timestamp
+    "signature" = $signature
+}
+
+Invoke-RestMethod -Uri $apiUrl -Method Get -Headers $headers -Body $params
+```
+
+**Python**:
+
 ```python
 import hmac
 import hashlib
 import time
+import requests
 
-device_id = "my-laptop"
+TOKEN = "your_access_token"
+DEVICE = "my-device"
+API_URL = "https://your-domain.com/open-door"
+
 timestamp = str(int(time.time()))
-access_token = "your_access_token"
-
-message = f"{device_id}:{timestamp}"
+message = f"{DEVICE}:{timestamp}"
 signature = hmac.new(
-    access_token.encode(),
+    TOKEN.encode(),
     message.encode(),
     hashlib.sha256
 ).hexdigest()
 
+print(f"Timestamp: {timestamp}")
 print(f"Signature: {signature}")
+
+headers = {"Authorization": f"Bearer {TOKEN}"}
+params = {
+    "device": DEVICE,
+    "timestamp": timestamp,
+    "signature": signature
+}
+
+response = requests.get(API_URL, headers=headers, params=params)
+print(response.json())
 ```
 
-**3. 发送请求**:
-```bash
-curl -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
-     "https://your-domain.com/open-door?device=my-laptop&timestamp=1738224000&signature=abc123..."
-```
+#### 何时启用签名验证？
 
-**防护效果**:
-- ✅ 防重放攻击 (时间戳 5 分钟有效期)
-- ✅ 防中间人攻击 (HMAC 签名验证)
-- ✅ 防密钥泄露后的滥用
+✅ **推荐启用**:
+- 服务器暴露在公网
+- 有安全合规要求 (ISO 27001, SOC 2 等)
+- TOKEN 泄露风险较高
+
+✅ **可以禁用** (`ENABLE_SIGNATURE=false`):
+- 仅内网使用
+- 所有客户端都在受控环境内
+- 定期轮换 TOKEN
+
+#### 防护效果
+
+- ✅ **防重放攻击**: 时间戳有效期仅 5 分钟
+- ✅ **防中间人攻击**: HMAC-SHA256 签名验证
+- ✅ **防密钥泄露**: TOKEN 泄露后 5 分钟自动失效
 
 ## ⚙️ 环境变量
 
