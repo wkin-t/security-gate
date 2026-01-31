@@ -2,6 +2,9 @@
 import os
 import sys
 import pytest
+import hmac
+import hashlib
+import time
 from unittest.mock import patch, MagicMock
 
 # 设置环境变量，然后导入 app
@@ -92,6 +95,114 @@ class TestAuthenticationRemoval:
         assert 'example' in data
         assert 'curl' in data['example'].lower()
         assert 'Authorization' in data['example']
+
+
+class TestSignatureVerification:
+    """测试签名验证功能"""
+
+    @pytest.fixture
+    def client(self):
+        """创建测试客户端"""
+        webhook_sg.app.config['TESTING'] = True
+        webhook_sg.app.config['DEBUG'] = True  # 禁用 HTTPS 检查
+        webhook_sg.limiter.enabled = False  # 禁用速率限制
+
+        with webhook_sg.app.test_client() as client:
+            yield client
+
+    def _generate_signature(self, device_id, timestamp):
+        """生成有效的 HMAC-SHA256 签名"""
+        message = f"{device_id}:{timestamp}"
+        signature = hmac.new(
+            b'test-token-1234567890abcdef',
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        return signature
+
+    def test_signature_disabled_no_signature_required(self, client):
+        """签名验证关闭时（默认），不需要签名"""
+        with patch('webhook_sg.update_security_group') as mock_update:
+            mock_update.return_value = (True, 'Success')
+
+            response = client.get(
+                '/open-door?device=test-device',
+                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+            )
+
+            assert response.status_code == 200
+            assert response.json['status'] == 'success'
+
+    def test_signature_enabled_valid_signature(self, client):
+        """签名验证启用时，有效签名应该通过"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            with patch('webhook_sg.update_security_group') as mock_update:
+                mock_update.return_value = (True, 'Success')
+
+                timestamp = str(int(time.time()))
+                signature = self._generate_signature('test-device', timestamp)
+
+                response = client.get(
+                    f'/open-door?device=test-device&timestamp={timestamp}&signature={signature}',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
+
+                assert response.status_code == 200
+                assert response.json['status'] == 'success'
+
+    def test_signature_enabled_no_signature(self, client):
+        """签名验证启用时，缺少签名应该返回 403"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            response = client.get(
+                '/open-door?device=test-device&timestamp=123456789',
+                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+            )
+
+            assert response.status_code == 403
+            assert response.json['error'] == 'Invalid signature'
+
+    def test_signature_enabled_invalid_signature(self, client):
+        """签名验证启用时，无效签名应该返回 403"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            timestamp = str(int(time.time()))
+
+            response = client.get(
+                f'/open-door?device=test-device&timestamp={timestamp}&signature=invalid_signature_12345',
+                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+            )
+
+            assert response.status_code == 403
+            assert response.json['error'] == 'Invalid signature'
+
+    def test_signature_enabled_expired_timestamp(self, client):
+        """签名验证启用时，过期的时间戳应该返回 403"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            # 使用 6 分钟前的时间戳（超过 5 分钟有效期）
+            old_timestamp = str(int(time.time()) - 400)
+            signature = self._generate_signature('test-device', old_timestamp)
+
+            response = client.get(
+                f'/open-door?device=test-device&timestamp={old_timestamp}&signature={signature}',
+                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+            )
+
+            assert response.status_code == 403
+            assert response.json['error'] == 'Invalid signature'
+
+    def test_signature_enabled_wrong_device_id(self, client):
+        """签名验证启用时，错误的设备 ID 应该导致签名验证失败"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            timestamp = str(int(time.time()))
+            # 为 test-device 生成签名，但请求使用不同的设备 ID
+            signature = self._generate_signature('test-device', timestamp)
+
+            response = client.get(
+                f'/open-door?device=wrong-device&timestamp={timestamp}&signature={signature}',
+                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+            )
+
+            assert response.status_code == 403
+            assert response.json['error'] == 'Invalid signature'
 
 
 if __name__ == '__main__':
