@@ -56,7 +56,7 @@ jobs:
         run: docker build -t security-gate:test .
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@5681af892cd0f4997658429c9aedaششتع8c4b0e8246 # v0.29.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: 'security-gate:test'
           format: 'sarif'
