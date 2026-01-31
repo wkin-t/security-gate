@@ -205,17 +205,25 @@ def open_door():
 
     认证方式:
     - Header: Authorization: Bearer <ACCESS_TOKEN>
-    - 或 URL 参数: ?key=<ACCESS_TOKEN> (不推荐)
 
     可选参数:
     - device: 设备标识
     - timestamp: 时间戳 (启用签名时必需)
     - signature: HMAC-SHA256 签名 (启用签名时必需)
     """
-    # 1. 验证认证 (优先使用 Header)
+    # 1. 检查是否尝试使用已弃用的 URL 参数认证
+    if 'key' in request.args:
+        logger.warning(
+            f"Deprecated URL parameter authentication attempted from {get_remote_address()}"
+        )
+        return {
+            "error": "URL parameter authentication is no longer supported",
+            "message": "Please use Authorization header instead",
+            "example": "curl -H 'Authorization: Bearer YOUR_TOKEN' https://domain.com/open-door"
+        }, 400
+
+    # 2. 验证 Header 认证
     token = request.headers.get('Authorization', '').replace('Bearer ', '')
-    if not token:
-        token = request.args.get('key', '')
 
     if not token or token != ACCESS_TOKEN:
         logger.warning(f"Unauthorized access from {get_remote_address()}")
