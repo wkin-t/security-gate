@@ -3,7 +3,7 @@ flask==3.1.2
 werkzeug==3.1.5
 
 # 生产服务器
-gunicorn==23.0.0
+gunicorn==24.1.1
 
 # 腾讯云 SDK
 tencentcloud-sdk-python==3.1.41
