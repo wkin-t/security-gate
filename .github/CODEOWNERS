@@ -1,0 +1,25 @@
+# CODEOWNERS - 代码审查负责人
+
+# 全局默认所有者
+* @wkin-t
+
+# 核心代码
+/webhook_sg.py @wkin-t
+
+# Docker 配置
+/Dockerfile @wkin-t
+/docker-compose.yml @wkin-t
+
+# 安全配置（需要严格审查）
+/SECURITY.md @wkin-t
+/.github/dependabot.yml @wkin-t
+/.github/workflows/** @wkin-t
+
+# 依赖管理
+/requirements.txt @wkin-t
+
+# 文档
+/README.md @wkin-t
+
+# 环境变量模板
+/.env.example @wkin-t
