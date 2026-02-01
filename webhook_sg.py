@@ -21,8 +21,13 @@ REGION = os.getenv("TENCENT_REGION", "ap-guangzhou")
 SECURITY_GROUP_ID = os.getenv("SECURITY_GROUP_ID", "")
 TARGET_PORT = os.getenv("TARGET_PORT", "ALL")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
-ENABLE_SIGNATURE = os.getenv("ENABLE_SIGNATURE", "false").lower() == "true"
-# ==========================================================
+ENABLE_SIGNATURE = os.getenv("ENABLE_SIGNATURE", "true").lower() == "true"
+ENABLE_IP_BLACKLIST = os.getenv("ENABLE_IP_BLACKLIST", "true").lower() == "true"
+ENABLE_NONCE = os.getenv("ENABLE_NONCE", "true").lower() == "true"
+MAX_AUTH_FAILURES = int(os.getenv("MAX_AUTH_FAILURES", "5"))  # 最大失败次数
+BLACKLIST_DURATION = int(os.getenv("BLACKLIST_DURATION", "3600"))  # 封禁时长（秒）
+NONCE_CACHE_SIZE = int(os.getenv("NONCE_CACHE_SIZE", "1000"))  # nonce 缓存大小
+# =========================================================
 
 # 设置日志格式
 logging.basicConfig(
@@ -39,6 +44,119 @@ limiter = Limiter(
     storage_uri="memory://",
 )
 
+# IP 黑名单数据结构
+# {ip: {'failures': count, 'first_failure': timestamp, 'blacklisted_until': timestamp}}
+ip_blacklist = {}
+
+# nonce 缓存 {nonce: timestamp}
+nonce_cache = {}
+
+
+def clean_expired_nonces():
+    """清理过期的 nonce（超过 5 分钟）"""
+    if not ENABLE_NONCE:
+        return
+
+    current_time = time.time()
+    expired_nonces = [
+        nonce for nonce, timestamp in nonce_cache.items()
+        if current_time - timestamp > 300  # 5 分钟
+    ]
+
+    for nonce in expired_nonces:
+        del nonce_cache[nonce]
+
+    # 如果缓存过大，删除最老的记录
+    if len(nonce_cache) > NONCE_CACHE_SIZE:
+        sorted_nonces = sorted(nonce_cache.items(), key=lambda x: x[1])
+        for nonce, _ in sorted_nonces[:len(nonce_cache) - NONCE_CACHE_SIZE]:
+            del nonce_cache[nonce]
+
+
+def is_nonce_used(nonce):
+    """检查 nonce 是否已被使用"""
+    if not ENABLE_NONCE or not nonce:
+        return False
+
+    clean_expired_nonces()
+    return nonce in nonce_cache
+
+
+def mark_nonce_used(nonce):
+    """标记 nonce 已使用"""
+    if not ENABLE_NONCE or not nonce:
+        return
+
+    nonce_cache[nonce] = time.time()
+
+
+def clean_expired_blacklist():
+    """清理过期的黑名单记录"""
+    current_time = time.time()
+    expired_ips = []
+
+    for ip, data in ip_blacklist.items():
+        # 清理已解除封禁的 IP
+        if 'blacklisted_until' in data and current_time > data['blacklisted_until']:
+            expired_ips.append(ip)
+        # 清理超过 5 分钟的失败记录
+        elif 'first_failure' in data and current_time - data['first_failure'] > 300:
+            if 'blacklisted_until' not in data:
+                expired_ips.append(ip)
+
+    for ip in expired_ips:
+        del ip_blacklist[ip]
+
+
+def is_ip_blacklisted(ip):
+    """检查 IP 是否被封禁"""
+    if not ENABLE_IP_BLACKLIST:
+        return False
+
+    clean_expired_blacklist()
+
+    if ip in ip_blacklist:
+        data = ip_blacklist[ip]
+        if 'blacklisted_until' in data:
+            if time.time() < data['blacklisted_until']:
+                return True
+            else:
+                # 封禁已过期，清除记录
+                del ip_blacklist[ip]
+
+    return False
+
+
+def record_auth_failure(ip):
+    """记录认证失败，必要时封禁 IP"""
+    if not ENABLE_IP_BLACKLIST:
+        return
+
+    current_time = time.time()
+
+    if ip not in ip_blacklist:
+        ip_blacklist[ip] = {
+            'failures': 1,
+            'first_failure': current_time
+        }
+    else:
+        data = ip_blacklist[ip]
+
+        # 如果距离第一次失败超过 5 分钟，重置计数
+        if current_time - data.get('first_failure', 0) > 300:
+            data['failures'] = 1
+            data['first_failure'] = current_time
+        else:
+            data['failures'] += 1
+
+        # 达到阈值，封禁 IP
+        if data['failures'] >= MAX_AUTH_FAILURES:
+            data['blacklisted_until'] = current_time + BLACKLIST_DURATION
+            logger.warning(
+                f"IP {mask_ip(ip)} blacklisted for {BLACKLIST_DURATION}s "
+                f"after {data['failures']} failed attempts"
+            )
+
 
 def get_client():
     """创建腾讯云 VPC 客户端"""
@@ -50,7 +168,7 @@ def get_client():
     return vpc_client.VpcClient(cred, REGION, clientProfile)
 
 
-def verify_signature(device_id, timestamp, signature):
+def verify_signature(device_id, timestamp, signature, nonce=None):
     """
     验证请求签名 (可选的增强安全功能)
 
@@ -58,6 +176,7 @@ def verify_signature(device_id, timestamp, signature):
         device_id: 设备标识
         timestamp: 请求时间戳
         signature: HMAC-SHA256 签名
+        nonce: 一次性随机数 (可选，启用时必需)
 
     Returns:
         bool: 签名是否有效
@@ -71,8 +190,22 @@ def verify_signature(device_id, timestamp, signature):
             logger.warning(f"Timestamp expired: {timestamp}")
             return False
 
+        # 如果启用 nonce，检查是否已使用
+        if ENABLE_NONCE:
+            if not nonce:
+                logger.warning("Nonce is required but not provided")
+                return False
+
+            if is_nonce_used(nonce):
+                logger.warning(f"Nonce already used: {nonce[:8]}...")
+                return False
+
         # 计算预期签名
-        message = f"{device_id}:{timestamp}"
+        if ENABLE_NONCE and nonce:
+            message = f"{device_id}:{timestamp}:{nonce}"
+        else:
+            message = f"{device_id}:{timestamp}"
+
         expected = hmac.new(
             ACCESS_TOKEN.encode(),
             message.encode(),
@@ -80,7 +213,13 @@ def verify_signature(device_id, timestamp, signature):
         ).hexdigest()
 
         # 使用安全的比较方法防止时序攻击
-        return hmac.compare_digest(signature, expected)
+        if hmac.compare_digest(signature, expected):
+            # 签名验证成功，标记 nonce 为已使用
+            if ENABLE_NONCE and nonce:
+                mark_nonce_used(nonce)
+            return True
+
+        return False
 
     except Exception as e:
         logger.error(f"Signature verification error: {e}")
@@ -206,16 +345,24 @@ def open_door():
     认证方式:
     - Header: Authorization: Bearer <ACCESS_TOKEN>
 
-    可选参数:
-    - device: 设备标识
-    - timestamp: 时间戳 (启用签名时必需)
+    必需参数:
+    - device: 设备标识 (推荐)
+    - timestamp: Unix 时间戳 (启用签名时必需)
     - signature: HMAC-SHA256 签名 (启用签名时必需)
+    - nonce: 一次性随机数 (启用 nonce 时必需，防重放)
     """
+    # 0. 检查 IP 黑名单
+    client_ip = get_remote_address()
+    if is_ip_blacklisted(client_ip):
+        logger.warning(f"Blacklisted IP {mask_ip(client_ip)} attempted access")
+        return {"error": "Access denied", "message": "Too many failed attempts"}, 403
+
     # 1. 检查是否尝试使用已弃用的 URL 参数认证
     if 'key' in request.args:
         logger.warning(
-            f"Deprecated URL parameter authentication attempted from {get_remote_address()}"
+            f"Deprecated URL parameter authentication attempted from {client_ip}"
         )
+        record_auth_failure(client_ip)
         return {
             "error": "URL parameter authentication is no longer supported",
             "message": "Please use Authorization header instead",
@@ -226,18 +373,21 @@ def open_door():
     token = request.headers.get('Authorization', '').replace('Bearer ', '')
 
     if not token or token != ACCESS_TOKEN:
-        logger.warning(f"Unauthorized access from {get_remote_address()}")
+        logger.warning(f"Unauthorized access from {client_ip}")
+        record_auth_failure(client_ip)
         return {"error": "Unauthorized"}, 403
 
     # 2. 获取参数
     device_id = request.args.get('device', 'Unknown-Device')
     timestamp = request.args.get('timestamp', '')
     signature = request.args.get('signature', '')
+    nonce = request.args.get('nonce', '')  # 一次性随机数
 
     # 3. 验证签名 (如果启用)
     if ENABLE_SIGNATURE:
-        if not verify_signature(device_id, timestamp, signature):
-            logger.warning(f"Invalid signature from {get_remote_address()}")
+        if not verify_signature(device_id, timestamp, signature, nonce):
+            logger.warning(f"Invalid signature from {client_ip}")
+            record_auth_failure(client_ip)
             return {"error": "Invalid signature"}, 403
 
     # 4. 获取真实 IP (优先使用 X-Real-IP，否则使用 X-Forwarded-For)

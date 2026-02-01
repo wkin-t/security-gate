@@ -5,6 +5,7 @@ import pytest
 import hmac
 import hashlib
 import time
+import uuid
 from unittest.mock import patch, MagicMock
 
 # 设置环境变量，然后导入 app
@@ -23,6 +24,10 @@ def client():
     webhook_sg.app.config['DEBUG'] = True  # 禁用 HTTPS 检查
     webhook_sg.limiter.enabled = False  # 禁用速率限制
 
+    # 清空黑名单和 nonce 缓存
+    webhook_sg.ip_blacklist.clear()
+    webhook_sg.nonce_cache.clear()
+
     with webhook_sg.app.test_client() as client:
         yield client
 
@@ -38,16 +43,17 @@ class TestAuthenticationRemoval:
 
     def test_header_authentication_success(self, client):
         """Header 认证应该正常工作"""
-        with patch('webhook_sg.update_security_group') as mock_update:
-            mock_update.return_value = (True, 'Success')
+        with patch('webhook_sg.ENABLE_SIGNATURE', False):  # 禁用签名验证以简化测试
+            with patch('webhook_sg.update_security_group') as mock_update:
+                mock_update.return_value = (True, 'Success')
 
-            response = client.get(
-                '/open-door?device=test-device',
-                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
-            )
+                response = client.get(
+                    '/open-door?device=test-device',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
 
-            assert response.status_code == 200
-            assert response.json['status'] == 'success'
+                assert response.status_code == 200
+                assert response.json['status'] == 'success'
 
     def test_url_parameter_authentication_rejected(self, client):
         """URL 参数认证应该被拒绝，返回 400 错误"""
@@ -107,6 +113,10 @@ class TestSignatureVerification:
         webhook_sg.app.config['DEBUG'] = True  # 禁用 HTTPS 检查
         webhook_sg.limiter.enabled = False  # 禁用速率限制
 
+        # 清空黑名单和 nonce 缓存
+        webhook_sg.ip_blacklist.clear()
+        webhook_sg.nonce_cache.clear()
+
         with webhook_sg.app.test_client() as client:
             yield client
 
@@ -122,87 +132,242 @@ class TestSignatureVerification:
 
     def test_signature_disabled_no_signature_required(self, client):
         """签名验证关闭时（默认），不需要签名"""
-        with patch('webhook_sg.update_security_group') as mock_update:
-            mock_update.return_value = (True, 'Success')
-
-            response = client.get(
-                '/open-door?device=test-device',
-                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
-            )
-
-            assert response.status_code == 200
-            assert response.json['status'] == 'success'
-
-    def test_signature_enabled_valid_signature(self, client):
-        """签名验证启用时，有效签名应该通过"""
-        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+        with patch('webhook_sg.ENABLE_SIGNATURE', False):
             with patch('webhook_sg.update_security_group') as mock_update:
                 mock_update.return_value = (True, 'Success')
 
-                timestamp = str(int(time.time()))
-                signature = self._generate_signature('test-device', timestamp)
-
                 response = client.get(
-                    f'/open-door?device=test-device&timestamp={timestamp}&signature={signature}',
+                    '/open-door?device=test-device',
                     headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
                 )
 
                 assert response.status_code == 200
                 assert response.json['status'] == 'success'
 
+    def test_signature_enabled_valid_signature(self, client):
+        """签名验证启用时，有效签名应该通过（不使用 nonce）"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            with patch('webhook_sg.ENABLE_NONCE', False):  # 禁用 nonce 以测试纯签名
+                with patch('webhook_sg.update_security_group') as mock_update:
+                    mock_update.return_value = (True, 'Success')
+
+                    timestamp = str(int(time.time()))
+                    signature = self._generate_signature('test-device', timestamp)
+
+                    response = client.get(
+                        f'/open-door?device=test-device&timestamp={timestamp}&signature={signature}',
+                        headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                    )
+
+                    assert response.status_code == 200
+                    assert response.json['status'] == 'success'
+
     def test_signature_enabled_no_signature(self, client):
         """签名验证启用时，缺少签名应该返回 403"""
         with patch('webhook_sg.ENABLE_SIGNATURE', True):
-            response = client.get(
-                '/open-door?device=test-device&timestamp=123456789',
-                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
-            )
+            with patch('webhook_sg.ENABLE_NONCE', False):
+                response = client.get(
+                    '/open-door?device=test-device&timestamp=123456789',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
 
-            assert response.status_code == 403
-            assert response.json['error'] == 'Invalid signature'
+                assert response.status_code == 403
+                assert response.json['error'] == 'Invalid signature'
 
     def test_signature_enabled_invalid_signature(self, client):
         """签名验证启用时，无效签名应该返回 403"""
         with patch('webhook_sg.ENABLE_SIGNATURE', True):
-            timestamp = str(int(time.time()))
+            with patch('webhook_sg.ENABLE_NONCE', False):
+                timestamp = str(int(time.time()))
 
-            response = client.get(
-                f'/open-door?device=test-device&timestamp={timestamp}&signature=invalid_signature_12345',
-                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
-            )
+                response = client.get(
+                    f'/open-door?device=test-device&timestamp={timestamp}&signature=invalid_signature_12345',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
 
-            assert response.status_code == 403
-            assert response.json['error'] == 'Invalid signature'
+                assert response.status_code == 403
+                assert response.json['error'] == 'Invalid signature'
 
     def test_signature_enabled_expired_timestamp(self, client):
         """签名验证启用时，过期的时间戳应该返回 403"""
         with patch('webhook_sg.ENABLE_SIGNATURE', True):
-            # 使用 6 分钟前的时间戳（超过 5 分钟有效期）
-            old_timestamp = str(int(time.time()) - 400)
-            signature = self._generate_signature('test-device', old_timestamp)
+            with patch('webhook_sg.ENABLE_NONCE', False):
+                # 使用 6 分钟前的时间戳（超过 5 分钟有效期）
+                old_timestamp = str(int(time.time()) - 400)
+                signature = self._generate_signature('test-device', old_timestamp)
 
-            response = client.get(
-                f'/open-door?device=test-device&timestamp={old_timestamp}&signature={signature}',
-                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
-            )
+                response = client.get(
+                    f'/open-door?device=test-device&timestamp={old_timestamp}&signature={signature}',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
 
-            assert response.status_code == 403
-            assert response.json['error'] == 'Invalid signature'
+                assert response.status_code == 403
+                assert response.json['error'] == 'Invalid signature'
 
     def test_signature_enabled_wrong_device_id(self, client):
         """签名验证启用时，错误的设备 ID 应该导致签名验证失败"""
         with patch('webhook_sg.ENABLE_SIGNATURE', True):
-            timestamp = str(int(time.time()))
-            # 为 test-device 生成签名，但请求使用不同的设备 ID
-            signature = self._generate_signature('test-device', timestamp)
+            with patch('webhook_sg.ENABLE_NONCE', False):
+                timestamp = str(int(time.time()))
+                # 为 test-device 生成签名，但请求使用不同的设备 ID
+                signature = self._generate_signature('test-device', timestamp)
 
-            response = client.get(
-                f'/open-door?device=wrong-device&timestamp={timestamp}&signature={signature}',
-                headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
-            )
+                response = client.get(
+                    f'/open-door?device=wrong-device&timestamp={timestamp}&signature={signature}',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
 
-            assert response.status_code == 403
-            assert response.json['error'] == 'Invalid signature'
+                assert response.status_code == 403
+                assert response.json['error'] == 'Invalid signature'
+
+
+class TestIPBlacklist:
+    """测试 IP 黑名单功能"""
+
+    @pytest.fixture
+    def client(self):
+        """创建测试客户端"""
+        webhook_sg.app.config['TESTING'] = True
+        webhook_sg.app.config['DEBUG'] = True
+        webhook_sg.limiter.enabled = False
+
+        # 清空黑名单
+        webhook_sg.ip_blacklist.clear()
+
+        with webhook_sg.app.test_client() as client:
+            yield client
+
+    def test_ip_blacklist_after_failures(self, client):
+        """失败次数达到阈值后 IP 被封禁"""
+        with patch('webhook_sg.ENABLE_IP_BLACKLIST', True):
+            with patch('webhook_sg.MAX_AUTH_FAILURES', 3):
+                # 前 2 次失败
+                for _ in range(2):
+                    response = client.get(
+                        '/open-door?device=test',
+                        headers={'Authorization': 'Bearer wrong-token'}
+                    )
+                    assert response.status_code == 403
+
+                # 第 3 次失败，触发封禁
+                response = client.get(
+                    '/open-door?device=test',
+                    headers={'Authorization': 'Bearer wrong-token'}
+                )
+                assert response.status_code == 403
+
+                # 下次请求应该被黑名单拦截
+                response = client.get(
+                    '/open-door?device=test',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
+                assert response.status_code == 403
+                assert response.json['error'] == 'Access denied'
+
+    def test_ip_blacklist_disabled(self, client):
+        """禁用黑名单时不应封禁"""
+        with patch('webhook_sg.ENABLE_IP_BLACKLIST', False):
+            # 多次失败
+            for _ in range(10):
+                response = client.get(
+                    '/open-door?device=test',
+                    headers={'Authorization': 'Bearer wrong-token'}
+                )
+                assert response.status_code == 403
+                assert response.json['error'] == 'Unauthorized'
+
+
+class TestNonceVerification:
+    """测试 nonce 防重放功能"""
+
+    @pytest.fixture
+    def client(self):
+        """创建测试客户端"""
+        webhook_sg.app.config['TESTING'] = True
+        webhook_sg.app.config['DEBUG'] = True
+        webhook_sg.limiter.enabled = False
+
+        # 清空 nonce 缓存
+        webhook_sg.nonce_cache.clear()
+
+        with webhook_sg.app.test_client() as client:
+            yield client
+
+    def _generate_signature_with_nonce(self, device_id, timestamp, nonce):
+        """生成包含 nonce 的签名"""
+        message = f"{device_id}:{timestamp}:{nonce}"
+        signature = hmac.new(
+            b'test-token-1234567890abcdef',
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        return signature
+
+    def test_nonce_enabled_valid_request(self, client):
+        """启用 nonce 时，有效的 nonce 应该通过"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            with patch('webhook_sg.ENABLE_NONCE', True):
+                with patch('webhook_sg.update_security_group') as mock_update:
+                    mock_update.return_value = (True, 'Success')
+
+                    timestamp = str(int(time.time()))
+                    nonce = str(uuid.uuid4())
+                    signature = self._generate_signature_with_nonce('test-device', timestamp, nonce)
+
+                    response = client.get(
+                        f'/open-door?device=test-device&timestamp={timestamp}&nonce={nonce}&signature={signature}',
+                        headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                    )
+
+                    assert response.status_code == 200
+                    assert response.json['status'] == 'success'
+
+    def test_nonce_enabled_duplicate_nonce(self, client):
+        """启用 nonce 时，重复的 nonce 应该被拒绝"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            with patch('webhook_sg.ENABLE_NONCE', True):
+                with patch('webhook_sg.update_security_group') as mock_update:
+                    mock_update.return_value = (True, 'Success')
+
+                    timestamp = str(int(time.time()))
+                    nonce = str(uuid.uuid4())
+                    signature = self._generate_signature_with_nonce('test-device', timestamp, nonce)
+
+                    # 第一次请求成功
+                    response1 = client.get(
+                        f'/open-door?device=test-device&timestamp={timestamp}&nonce={nonce}&signature={signature}',
+                        headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                    )
+                    assert response1.status_code == 200
+
+                    # 重复相同的 nonce，应该被拒绝
+                    response2 = client.get(
+                        f'/open-door?device=test-device&timestamp={timestamp}&nonce={nonce}&signature={signature}',
+                        headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                    )
+                    assert response2.status_code == 403
+                    assert response2.json['error'] == 'Invalid signature'
+
+    def test_nonce_enabled_missing_nonce(self, client):
+        """启用 nonce 时，缺少 nonce 应该被拒绝"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', True):
+            with patch('webhook_sg.ENABLE_NONCE', True):
+                timestamp = str(int(time.time()))
+                # 不包含 nonce 的签名
+                message = f"test-device:{timestamp}"
+                signature = hmac.new(
+                    b'test-token-1234567890abcdef',
+                    message.encode(),
+                    hashlib.sha256
+                ).hexdigest()
+
+                response = client.get(
+                    f'/open-door?device=test-device&timestamp={timestamp}&signature={signature}',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
+
+                assert response.status_code == 403
+                assert response.json['error'] == 'Invalid signature'
 
 
 if __name__ == '__main__':
