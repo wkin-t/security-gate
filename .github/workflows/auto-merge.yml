@@ -1,0 +1,31 @@
+name: Auto Merge on Review Success
+
+on:
+  check_run:
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.event.check_run.name == 'claude-review' && github.event.check_run.conclusion == 'success'
+
+    steps:
+      - name: Get PR info
+        id: pr
+        run: |
+          PR_NUMBER=$(gh pr list --head "${{ github.event.check_run.head_branch }}" --repo "${{ github.repository }}"
+--json number --jq '.[0].number')
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto merge PR
+        if: steps.pr.outputs.pr_number != ''
+        run: |
+          gh pr merge ${{ steps.pr.outputs.pr_number }} --repo "${{ github.repository }}" --auto --squash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
