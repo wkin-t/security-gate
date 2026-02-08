@@ -17,8 +17,7 @@ jobs:
       - name: Get PR info
         id: pr
         run: |
-          PR_NUMBER=$(gh pr list --head "${{ github.event.check_run.head_branch }}" --repo "${{ github.repository }}"
---json number --jq '.[0].number')
+          PR_NUMBER=$(gh pr list --head "${{ github.event.check_run.head_branch }}" --repo "${{ github.repository }}" --json number --jq '.[0].number')
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

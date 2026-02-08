@@ -9,6 +9,10 @@ on:
     # 每周一早上 9:00 运行
     - cron: '0 1 * * 1'
 
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   dependency-scan:
     name: Python Dependency Security Scan
@@ -56,14 +60,14 @@ jobs:
         run: docker build -t security-gate:test .
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
         with:
           image-ref: 'security-gate:test'
           format: 'sarif'
           output: 'trivy-results.sarif'
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
+        uses: github/codeql-action/upload-sarif@45cbd0c69e560cd9e7cd7f8c32362050c9b7ded2 # v4
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         with:
           sarif_file: 'trivy-results.sarif'

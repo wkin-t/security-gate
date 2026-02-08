@@ -16,7 +16,7 @@
 
 1. **私密报告**
    - GitHub Security Advisories: https://github.com/wkin-t/security-gate/security/advisories/new
-   - 或发送邮件至: q446143643@gmail.com
+   - 如果无法使用 Advisory，请先创建不含漏洞细节的 Issue，说明需要私下安全联络
 
 2. **包含信息**
    - 漏洞类型和影响范围
