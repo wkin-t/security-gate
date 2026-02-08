@@ -54,6 +54,25 @@ class TestAuthenticationRemoval:
 
                 assert response.status_code == 200
                 assert response.json['status'] == 'success'
+                assert response.json['message'] == 'Security group rules updated'
+                assert 'request_id' in response.json
+
+    def test_update_failure_does_not_expose_internal_error(self, client):
+        """后端错误不应把内部异常细节回传给客户端"""
+        with patch('webhook_sg.ENABLE_SIGNATURE', False):
+            with patch('webhook_sg.update_security_group') as mock_update:
+                mock_update.return_value = (False, "Traceback: secret details")
+
+                response = client.get(
+                    '/open-door?device=test-device',
+                    headers={'Authorization': 'Bearer test-token-1234567890abcdef'}
+                )
+
+                assert response.status_code == 500
+                assert response.json['status'] == 'error'
+                assert response.json['message'] == 'Failed to update security group'
+                assert 'request_id' in response.json
+                assert 'Traceback' not in response.json['message']
 
     def test_url_parameter_authentication_rejected(self, client):
         """URL 参数认证应该被拒绝，返回 400 错误"""

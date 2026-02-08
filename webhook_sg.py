@@ -4,6 +4,7 @@ import logging
 import hmac
 import hashlib
 import time
+import uuid
 from flask import Flask, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -27,6 +28,9 @@ ENABLE_NONCE = os.getenv("ENABLE_NONCE", "true").lower() == "true"
 MAX_AUTH_FAILURES = int(os.getenv("MAX_AUTH_FAILURES", "5"))  # 最大失败次数
 BLACKLIST_DURATION = int(os.getenv("BLACKLIST_DURATION", "3600"))  # 封禁时长（秒）
 NONCE_CACHE_SIZE = int(os.getenv("NONCE_CACHE_SIZE", "1000"))  # nonce 缓存大小
+RUN_DEBUG = os.getenv("RUN_DEBUG", "false").lower() == "true"
+RUN_HOST = os.getenv("RUN_HOST", "0.0.0.0")
+RUN_PORT = int(os.getenv("RUN_PORT", "35555"))
 # =========================================================
 
 # 设置日志格式
@@ -314,9 +318,9 @@ def update_security_group(current_ip, device_id):
         logger.info(msg)
         return True, msg
 
-    except Exception as e:
-        logger.error(f"TencentCloud API Error: {e}")
-        return False, str(e)
+    except Exception:
+        logger.exception("TencentCloud API error")
+        return False, "internal_error"
 
 
 @app.before_request
@@ -397,12 +401,23 @@ def open_door():
         user_ip = forwarded_for.split(',')[0].strip() if forwarded_for else request.remote_addr
 
     # 5. 执行业务逻辑
+    request_id = str(uuid.uuid4())
     success, msg = update_security_group(user_ip, device_id)
 
     if success:
-        return {"status": "success", "message": msg}, 200
+        logger.info("Request %s succeeded: %s", request_id, msg)
+        return {
+            "status": "success",
+            "message": "Security group rules updated",
+            "request_id": request_id
+        }, 200
     else:
-        return {"status": "error", "message": msg}, 500
+        logger.error("Request %s failed: %s", request_id, msg)
+        return {
+            "status": "error",
+            "message": "Failed to update security group",
+            "request_id": request_id
+        }, 500
 
 
 @app.errorhandler(429)
@@ -421,5 +436,4 @@ if __name__ == '__main__':
     if len(ACCESS_TOKEN) < 32:
         logger.warning("ACCESS_TOKEN is weak! Use at least 32 characters.")
 
-    # 开发模式
-    app.run(host='0.0.0.0', port=35555, debug=True)
+    app.run(host=RUN_HOST, port=RUN_PORT, debug=RUN_DEBUG)
